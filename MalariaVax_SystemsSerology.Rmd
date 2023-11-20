@@ -1,0 +1,680 @@
+---
+title: "MalariaVax Data Processing"
+author: "Christine Davis"
+date: "1/4/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+The systemsseRology package is dependent on ropls and must be downloaded from 
+github. Please run the following in your console prior to utilizing this Rmd.
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("ropls")
+install.packages("devtools")
+library(devtools)
+install_github("LoosC/systemsseRology", ref = "reboot")
+
+
+Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls())
+```
+
+Load packages
+```{r load}
+library(systemsseRology)
+library(readxl)
+library(hablar)
+library(pheatmap)
+library(DMwR)
+library(RColorBrewer)
+library(summarytools)
+library(ggpubr)
+library(tidyr)
+library(ggplot2)
+library(ggforce)
+library(ggsignif)
+library(tidyverse)
+library(ropls)
+library(corrr)
+library(igraph)
+library(ggraph)
+library(ggrepel)
+set.seed(0)  # random seed for reproducibility
+```
+
+# Classification and preprocessing
+
+Read the data from an Excel file. Z-score the data and assign the label in the variable y.
+
+Data includes 37 parameters and 44 samples, divided into 4 classes (vaccine regimes 1-4, with regime 3 being DFx)
+Group labels (y, in PCA): column 3
+X-data: columns 7-70
+Data pre-processing performed to: 
+1) exclude measurements (blue starred measurements in data spreadsheet) --> 
+processed as NA, warnings suppressed
+2) average replicates (23 assays have duplicates, 1 assay has 4-peat)
+
+```{r data}
+#Load data
+file_name <- "../MalariaVax/RH5 VAC063 G1-4 systems serology.xlsx"
+data <- as.data.frame(read_excel(file_name, sheet = "UPDATED Subset Data"))
+X <- suppressWarnings(
+  as.matrix(as.data.frame(lapply(data[, 7:ncol(data)], as.numeric))))
+data_new <- data[,7:19] #Pull glycan data, which has no replicates to average
+
+#Average all duplicate measurements and rename
+data_new$"IgG" <- rowMeans(X[,c(14,15)],na.rm = TRUE)
+data_new$"IgM" <- rowMeans(X[,c(16,17)],na.rm = TRUE)
+data_new$"IgA1" <- rowMeans(X[,c(18,19)],na.rm = TRUE)
+data_new$"IgA2" <- rowMeans(X[,c(20,21)],na.rm = TRUE)
+data_new$"IgG1" <- rowMeans(X[,c(22,23)],na.rm = TRUE)
+data_new$"IgG3" <- rowMeans(X[,c(24,25)],na.rm = TRUE)
+data_new$"IgG2" <- rowMeans(X[,c(26,27)],na.rm = TRUE)
+data_new$"IgG4" <- rowMeans(X[,c(28,29)],na.rm = TRUE)
+data_new$"FcR2AH" <- rowMeans(X[,c(30,31)],na.rm = TRUE)
+data_new$"FcR2AR" <- rowMeans(X[,c(32,33)],na.rm = TRUE)
+data_new$"FcR3AF" <- rowMeans(X[,c(34,35)],na.rm = TRUE)
+data_new$"FcR3AV" <- rowMeans(X[,c(36,37)],na.rm = TRUE)
+data_new$"FcR2B" <- rowMeans(X[,c(38,39)],na.rm = TRUE)
+data_new$"FcR3B" <- rowMeans(X[,c(40,41)],na.rm = TRUE)
+data_new$"FcaR" <- rowMeans(X[,c(42,43)],na.rm = TRUE)
+data_new$"FcRN" <- rowMeans(X[,c(44,45)],na.rm = TRUE)
+data_new$"C1q" <- rowMeans(X[,c(46,47)],na.rm = TRUE)
+data_new$"AvidityIndex" <- rowMeans(X[,c(48,49)],na.rm = TRUE)
+data_new$"ADCP" <- rowMeans(X[,c(50,51)],na.rm = TRUE)
+data_new$"ADCD" <- rowMeans(X[,c(52,53)],na.rm = TRUE)
+data_new$"ADNP" <- rowMeans(X[,c(54,55,56,57)],na.rm = TRUE) #4 replicates ADNP
+data_new$"ADNKAMIP1BwithinNKs" <- rowMeans(X[,c(58,59)],na.rm = TRUE)
+data_new$"ADNKACD107awithinNKs" <- rowMeans(X[,c(60,61)],na.rm = TRUE)
+data_new$"ADNKAIFNgwithinNKs" <- rowMeans(X[,c(62,63)],na.rm = TRUE)
+
+#Ensure all data is numeric form
+X <- suppressWarnings(as.matrix(as.data.frame(lapply(data_new, as.numeric))))
+
+#Rename columns to be more usable
+evens <- seq(2,26,2)
+colnames(X)[1:13] <- unlist(strsplit(colnames(X)[1:13],"...",fixed = T))[evens]
+colnames(X) <- gsub(".","", fixed = TRUE, colnames(X))
+
+## Remove columns with more than 50% NA, then use k-nearest neighbors on 
+# ONLY multivariate analysis data to impute missing values
+rownames(X) <- data[,1] #trial subject numbers
+Ximp <- X[, which(colMeans(!is.na(X)) > 0.5)]
+Ximp <- impute.knn(Ximp, k = 3)#knnImputation(Ximp, k=3)
+Ximp <- Ximp$data
+#no imputation for data intended for univariate analysis
+X_uni <-X[, which(colMeans(!is.na(X)) > 0.5)] 
+```
+
+#Optional normalization section
+Only run these if you plan to normalize to individual titers or group means
+Skip to "Finish preprocessing, create heatmap" if not.
+
+Check if distribution is normal if you plan to normalize by mean or 
+median of group. Can use mean if normally distributed, but otherwise should
+consider median.
+
+```{r distribution check}
+#Visually examine distributions
+ggdensity(Ximp[which(grepl("1", (data[, 3]))),11], 
+          main = "Density plot of IgG Group 1",
+          xlab = "IgG")
+ggdensity(Ximp[which(grepl("2", (data[, 3]))),11], 
+          main = "Density plot of IgG Group 2",
+          xlab = "IgG")
+ggdensity(Ximp[which(grepl("3", (data[, 3]))),11], 
+          main = "Density plot of IgG Group 3",
+          xlab = "IgG")
+ggdensity(Ximp[which(grepl("4", (data[, 3]))),11], 
+          main = "Density plot of IgG Group 4",
+          xlab = "IgG")
+#Normality check via Shapiro-Wilk test
+shapiro.test(Ximp[which(grepl("1", (data[, 3]))),11])
+shapiro.test(Ximp[which(grepl("2", (data[, 3]))),11])
+shapiro.test(Ximp[which(grepl("3", (data[, 3]))),11])
+shapiro.test(Ximp[which(grepl("4", (data[, 3]))),11])
+```
+
+Option 1: Normalize all to IgG per individual
+
+```{r Normalize on per-individual titer}
+#Multivariate data processing
+IgG <- Ximp[,11] #pull titer values
+Ximp_norm <- as.matrix(Ximp)/as.numeric(t(IgG))
+Ximp_norm[,11] <- IgG #replace vector of 1s with original IgG values
+Ximp_norm[,1:10] <- Ximp[,1:10] #don't normalize % glycosylation by IgG
+
+#Repeat for univariate data
+IgG_uni <- X_uni[,11] 
+X_uni_norm <- as.matrix(X_uni)/as.numeric(t(IgG_uni))
+X_uni_norm[,11] <- IgG_uni
+X_uni_norm[,1:10] <- X_uni[,1:10]
+```
+
+Option 2: this section normalizes all vaccinees within a group (1/2/3/4) 
+to the mean or median of their group's IgG measurement. Change mean <-> median
+based on any normality assumptions
+
+```{r Normalize by Median/Mean IgG}
+
+#Get group-specific rows for all features
+#Multivariate data
+Ximp_1 <- as.matrix(Ximp[which(grepl("1", (data[, 3]))),])
+Ximp_2 <- as.matrix(Ximp[which(grepl("2", (data[, 3]))),])
+Ximp_3 <- as.matrix(Ximp[which(grepl("3", (data[, 3]))),])
+Ximp_4 <- as.matrix(Ximp[which(grepl("4", (data[, 3]))),])
+#Univariate data
+Xuni_1 <- as.matrix(X_uni[which(grepl("1", (data[, 3]))),])
+Xuni_2 <- as.matrix(X_uni[which(grepl("2", (data[, 3]))),])
+Xuni_3 <- as.matrix(X_uni[which(grepl("3", (data[, 3]))),])
+Xuni_4 <- as.matrix(X_uni[which(grepl("4", (data[, 3]))),])
+
+#Get mean or median of group IgG and divide all group features by it. 
+#Put normalized values into Ximp_norm matrix. Swap out mean or median based on 
+#normality of data calculated above with Shapiro-Wilk normality test
+
+#Multivariate data
+Ximp_1b <- Ximp_1/as.numeric(median(Ximp_1[,11]))
+Ximp_2b <- Ximp_2/as.numeric(median(Ximp_2[,11]))
+Ximp_3b <- Ximp_3/as.numeric(median(Ximp_3[,11]))
+Ximp_4b <- Ximp_4/as.numeric(median(Ximp_4[,11]))
+Ximp_norm <- rbind(Ximp_1b, Ximp_2b, Ximp_3b, Ximp_4b)
+
+#Repeat for univariate data
+Xuni_1b <- Xuni_1/as.numeric(median(Xuni_1[,11]))
+Xuni_2b <- Xuni_2/as.numeric(median(Xuni_2[,11]))
+Xuni_3b <- Xuni_3/as.numeric(median(Xuni_3[,11]))
+Xuni_4b <- Xuni_4/as.numeric(median(Xuni_4[,11]))
+X_uni_norm <- rbind(Xuni_1b, Xuni_2b, Xuni_3b, Xuni_4b)
+
+#Replace features 1-11 with non-normalized values for glycans and IgG
+X_uni_norm[,1:11] <- X_uni[,1:11]
+
+```
+
+Finish pre-processing, create heatmap
+
+```{r finalize data, create heatmap}
+#Comment out this section if not normalizing to titer
+###
+#Ximp <- scale(Ximp_norm, center = TRUE, scale = TRUE)
+#X_uni <- scale(X_uni_norm, center = TRUE, scale = TRUE)
+###
+
+#Comment out this section if normalizing to titer
+###
+Ximp <- scale(Ximp, center = TRUE, scale = TRUE)
+X_uni <- scale(X_uni, center = TRUE, scale = TRUE)
+###
+
+y <- factor(data[, 3]) #group number for each subject
+names(y) <- rownames(X)
+
+#Create heatmap annotation for coloring by group
+annotation_row = data.frame(group = y)
+rownames(annotation_row) <- rownames(Ximp)
+my_colors <- list(
+  group = c("1" = '#8C02CC', "2" = '#5192C3', "3" = '#45C902', "4" = '#045CFF')
+  )
+
+#Create heatmap of the z-scored data indicating vaccination group
+p <- pheatmap(Ximp, annotation_colors = my_colors, 
+              annotation_row = annotation_row, 
+              cluster_cols = F, cluster_rows = F,
+              cellwidth = 4, cellheight = 4, fontsize = 3, 
+              border_color = "NA", treeheight_row = 3, 
+              treeheight_col = 3)
+
+#print to pdf- change to be appropriate to your own directory
+pdf("../MalariaVax/Figures/heatmap.pdf", 
+       width = 8, height = 5) 
+print(p)
+dev.off()
+```
+
+The variable df_features contains information about the features, mainly used for visualization routines. 
+
+```{r annotation}
+#Add feature names to univariate dataframe
+df_features_uni <- data.frame(name = colnames(X))
+df_features_uni$attribute <- factor(df_features_uni$name)
+
+#Add feature names to multivariate dataframe
+df_features <- data.frame(name = colnames(Ximp))
+df_features$label <- factor(df_features$name)
+df_features$feature_class <- rep(NA, length = nrow(df_features))
+
+#Name features based on feature type
+df_features$feature_class[which(grepl("G0|G1|G2", df_features$name))] <- "glycan"
+df_features$feature_class[which(grepl("IgG|IgA|IgM", df_features$name))] <- "titer"
+df_features$feature_class[which(grepl("FcR", df_features$name))] <- "FcR"
+df_features$feature_class[which(grepl("FcaR", df_features$name))] <- "FcR"
+df_features$feature_class[which(grepl("AD", df_features$name))] <- "function"
+df_features$feature_class[which(grepl("Avid", df_features$name))] <- "function"
+df_features$feature_class[which(grepl("C1q", df_features$name))] <- "FcR"
+print(df_features)
+
+```
+
+#Univariate plotting
+
+Assess feature differences between vaccinated groups 1-4 using Kruskal-Wallis 
+tests, corrected for multiple testing using the Benjamini-Hochberg procedure. 
+If significant differences are found, proceed to test pair-wise by Wilcoxon 
+testing. Stars indicate significance as (*p < 0.05, **p < 0.01, ***p < 0.001).
+
+Plot all features grouped by class.
+
+```{r univariate statistics}
+# Reformat the data as a long dataframe for the plotting procedure
+dfBox <- reshape2::melt(cbind(as.data.frame(X_uni, group = names(y)), 
+                              id.var = y))
+colnames(dfBox) <- c("group", "features", "value")
+#Which groups do you want to compare?
+my_comparisons <- list( c("1", "2"), c("1", "3"), c("1", "4") , 
+                        c("2", "3"), c("2", "4"), c("3", "4") )
+
+#Calculate unmodified p-values using Kruskal-Wallis test
+feature_list <- as.character(unique(dfBox$features))
+pvalue <- rep(NA, length=length(feature_list))
+
+#Loops over all unique features, testing via KW and pulling out/storing p-value
+for (i in 1:length(pvalue))
+  {
+  featuredfeature <- feature_list[i]
+  subset <- dfBox[dfBox$features == featuredfeature,]
+  kwvalue <- subset[,3] #feature value
+  kwclass <- subset[,1] #group assignment
+  dfB <- kruskal.test(x = kwvalue, g = kwclass)
+  pvalue[i] <- dfB[3]
+}
+
+#Adjust p-value by Benjamini-Hochberg correction for multiple testing
+pvalue_new <- round(p.adjust(pvalue, "BH"),3)
+
+#Choose only features with adj. p-value < 0.05
+indFeatures <- which(pvalue_new < 0.05 , pvalue_new)
+sigfeat <- feature_list[indFeatures]
+
+```
+#Plot Univariate Plots
+
+```{r Univariate Plots}
+
+#Only use these plots with significant differences for features in sigfeat
+#(have a significant Kruskal-Wallis score). Otherwise, comment out 
+#stat_compare_means lines 312-317 to get basic plots.
+
+i = 0
+for (feature in feature_list){
+  i = i+1
+  testtest <- dfBox[dfBox$features == feature,] #pull only feature of interest
+  
+  p <- ggplot(testtest, aes(x = group, y = value, fill = group), color = group) + 
+      scale_fill_manual(values = c('#8C02CC','#5192C3','#45C902','#045CFF')) +
+      stat_boxplot(position = position_dodge(width = 0.75), 
+                   geom = 'errorbar', width = 0.2) +
+    # don't show outliers
+     geom_boxplot(outlier.shape = NA) + 
+    # add points for individual measurements
+     geom_point(position = position_jitterdodge(), shape = 21, size = 1, 
+                aes(fill = group), color = "black") + 
+     ylab("z-scored value") + 
+     xlab(feature) +
+     stat_compare_means(method = "wilcox.test", #Mann-Whitney U
+                        paired = FALSE,
+                        #Which comparisons do you want to make?
+                        comparisons = my_comparisons, 
+                        #What star number do you want for each sig. level?
+                        symnum.args = list(cutpoints = c(0, 0.0001, 0.001, 
+                                                         0.01, 0.05, 1), 
+                                           symbols = c("****", "***", "**", 
+                                                       "*", "ns")), 
+                        hide.ns = TRUE) +
+     theme_classic() +
+     theme(axis.text.x=element_blank(), axis.ticks.x=element_blank())
+
+    #print to pdf- change to be appropriate to your own directory
+    pdf(paste0("../MalariaVax/Figures/Univariate_", feature, ".pdf"), 
+           width = 8, height = 5) 
+    print(p)
+    dev.off()
+}
+```
+
+#Multivariate plotting
+PCA and PLS-DA (using the package ropls) and visualization.
+
+To compare Group 3 vs Group1/2/4 combined, run this box
+```{r G3 v G124}
+y_124 <- as.character(y)
+
+#Rename all subjects in groups 1,2,4 as members of combined group, and members
+#of group 3 as members of that group
+y_124[which(grepl("1|2|4", y_124))] <- "G124"
+y_124[which(grepl("3", y_124))] <- "G3"
+#subgroup-specific X and y values
+y_subgroup <- as.factor(y_124)
+X_subgroup <- Ximp
+```
+
+To compare Group 3/4 combined vs Group 1/2 combined, run this box
+```{r G34 v G12}
+y_12 <- as.character(y)
+#Rename all subjects in groups 1, 2 as members of combined group, and members
+#of groups 3,4  as members of combined group
+y_12[which(grepl("1|2", y_12))] <- "G12"
+y_12[which(grepl("3|4", y_12))] <- "G34"
+#subgroup-specific X and y values
+y_subgroup <- as.factor(y_12)
+X_subgroup <- Ximp
+```
+
+To compare Group 3 vs Group 4, run this box
+```{r G3 v G4}
+y_34 <- as.character(y)
+#Rename all subjects in group 3 as members of that group, and members
+#of group 4  as members of that group. Drop all others.
+y_34[which(grepl("3", y_34))] <- "G3"
+y_34[which(grepl("4", y_34))] <- "G4"
+Ximp <- Ximp[which(grepl("3|4", y_34)),]
+y_subgroup <- as.factor(y_34[which(grepl("G3|G4", y_34))])
+
+#subgroup-specific X and y values
+y_subgroup <- droplevels(y_subgroup)
+X_subgroup <- as.matrix(Ximp)
+```
+
+#PLS-DA, all features
+Visualize group separation with PLS-DA, using all features
+```{r PLSDA vis}
+
+#Define colors based on feature class and group
+my_colors <- list(group = c('G3' = '#45C902','G124' = '#2D3880', 
+                            'G12' = '#8C02CC', 'G34' = '#FFA704', 
+                            'G4' = '#045CFF'), 
+                  feature_class = c('glycan' = '#AB6FC9', 'function' = '#5192C3',
+                                    'titer' = '#6FB06D', 'FcR' = 'red'))
+
+# general options for plotting
+opts_plot <- list(df_features = df_features,
+                  loading_alpha = 1, # transparency for the loadings
+                  score_alpha = 1, # transparency for the scores
+                  LV_ind = c(1,2), # which LVs to plot
+                  n_LV = 2, # number of latent variables
+                  # according to which property the features should be colored
+                  color_features = "group", 
+                  colors = my_colors, #which colors do you want to use?
+                  y_name = "group") #what should your subjects be named by
+
+opts_plot2 <- list(df_features = df_features,
+                  loading_alpha = 1, 
+                  score_alpha = 1, 
+                  LV_ind = c(1,2), 
+                  n_LV = 2,
+                  color_features = "feature_class", 
+                  colors = my_colors,
+                  y_name = "group") 
+
+# Perform a simple PCA
+model_pca <- pca_ropls(X_subgroup)
+ropls::getSummaryDF(model_pca) #Get PCA summary diagnostics
+plt_scores_pca <- visualize_ropls_scores(model_pca, y_subgroup, 
+                                         options = opts_plot)
+print(plt_scores_pca) #plot PCA scores
+
+# Perform a PLS-DA and plot the scores and loadings
+model <- train_ropls(X_subgroup, y_subgroup, options = opts_plot2)
+ropls::getSummaryDF(model) #Get PLS-DA summary diagnostics
+plt_scores <- visualize_ropls_scores(model, y_subgroup, options = opts_plot2)
+print(plt_scores) #plot PLS-DA scores
+
+plt_loadings <- visualize_ropls_loadings(model, options = opts_plot2)
+print(plt_loadings) #plot PLS-DA loadings
+
+#Set additional options required to color code enrichment 
+#in the bar plot of the loadings
+
+#Latent Variable 1
+opts_plot$X <- X_subgroup
+opts_plot$y <- y_subgroup
+opts_plot$LV_ind <- 1 #which latent variable should be plotted?
+opts_plot$mark_enrichment <- TRUE #will mark which group feature is enriched in
+plt_loadings_bar <- visualize_ropls_loadings_bar(model, options = opts_plot)
+print(plt_loadings_bar)
+
+#Latent Variable 2
+opts_plot2$X <- X_subgroup
+opts_plot2$y <- y_subgroup
+opts_plot2$LV_ind <- 2
+opts_plot2$mark_enrichment <- TRUE
+plt_loadings_bar <- visualize_ropls_loadings_bar(model, options = opts_plot2)
+print(plt_loadings_bar)
+
+```
+
+#Cross Validation, all features
+Validate full model, 5 folds and 10 trials. Also permute 5 fold, 100 trials
+This process will take time to run, so allow for adequate time
+
+```{r Validation of full model}
+method = list(train = train_ropls,
+              predict = predict_ropls,
+              score = score_accuracy)
+
+#How many total trials, permutation (pt) trials, and random feature (rf) trials?
+opts = list(n_trials = 10, n_folds = 5, pt_trials = 100, rf_trials = 0)
+
+return_vals1 <- validate_repeat(X_subgroup, y_subgroup, 
+                                method, opts, n_trials = 10)
+systemsseRology::visualize_validate(return_vals1)
+u1 <- rowMeans((sapply(return_vals1, unlist)))[1]
+#Average cross-validation score
+u1
+```
+
+#Feature Selection Validation and Permutation testing
+
+Visualize group separation with PLS-DA, using LASSO-selected features
+
+```{r Select Features}
+
+#Select features using LASSO feature selection, 100-rounds, keeping only
+#features selected in 80+% of rounds
+opts_sel <- list(n_trials = 100, threshold = 0.8, return_count = TRUE)
+sel_features <- select_repeat(X_subgroup, y_subgroup, 
+                              selector = select_lasso, 
+                              options = opts_sel)
+X_sel <- X_subgroup[, sel_features$sel_features] #retain only selected features
+
+#To test the importance of FcRN on overall results, remove FcRN as a feature
+#Uncomment this to explore importance
+#X_sel <- X_sel[,which(colnames(X_sel) != "FcRN")]
+
+# Perform a PLS-DA using the selected features and plot the scores and loadings
+# Check number of latent variables and increase to 2 if <2 
+#(for visualization purposes)
+opts_plot2 <- list(df_features = df_features,
+                  loading_alpha = 1, 
+                  score_alpha = 1, 
+                  LV_ind = c(1,2), 
+                  n_LV = 2,
+                  color_features = "feature_class", 
+                  colors = my_colors,
+                  y_name = "group") 
+opts_model <- list(n_LV = 2,
+                  color_features = "group", 
+                  colors = my_colors,
+                  y_name = "group",
+                  y = y_subgroup)
+#Perform PCA
+model_pca <- pca_ropls(X_sel)
+ropls::getSummaryDF(model_pca) #summary statistics
+
+#Perform PLS-DA with only selected features
+model <- train_ropls(X_sel, y_subgroup, options = opts_model)
+ropls::getSummaryDF(model) #summary statistics
+
+#Visualize PLS-DA scores with only selected features
+plt_scores <- visualize_ropls_scores(model, y_subgroup, options = opts_model)
+print(plt_scores)
+
+#Visualize PLS-DA loadings with only selected features
+plt_loadings <- visualize_ropls_loadings(model, options = opts_plot2)
+print(plt_loadings)
+
+#print to pdf, changing folder path to suite your environment
+#Additionally, consider changing file name to correct group comparison
+pdf("../MalariaVax/Figures/PLSDA_scores_G34vG12_selected.pdf", 
+       width = 8, height = 5) 
+print(plt_scores)
+dev.off()
+pdf("../MalariaVax/Figures/PLSDA_loadings_G34vG12_selected.pdf", 
+       width = 8, height = 5) 
+print(plt_loadings)
+dev.off()
+
+# set additional options required to color code enrichment in the bar plot of the loadings
+#Latent Variable 1
+opts_plot$X <- X_sel
+opts_plot$y <- y_subgroup
+opts_plot$LV_ind <- 1 #which latent variable should be plotted?
+opts_plot$mark_enrichment <- TRUE #will mark which group feature is enriched in
+plt_loadings_bar <- visualize_ropls_loadings_bar(model, options = opts_plot2)
+print(plt_loadings_bar)
+#Latent Variable 2
+opts_plot2$LV_ind <- 2
+plt_loadings_bar <- visualize_ropls_loadings_bar(model, options = opts_plot2)
+print(plt_loadings_bar)
+
+#plot of times selected vs feature, colored by feature name/class
+df_features_sel <- df_features
+row.names(df_features_sel) <- df_features$name
+df_features_sel$feature_count <- sel_features$feature_count
+plt <- ggplot(df_features_sel, aes(x = reorder(name,-feature_count), 
+                                  y = feature_count, fill = feature_class)) + 
+     geom_bar(stat = "identity", show.legend = TRUE) +
+     geom_hline(yintercept = 80, color = "black") +
+     scale_fill_manual(values = my_colors$feature_class) +
+     ylab("Selection Frequency") +
+     xlab("Feature") +
+     theme_classic() +
+     theme(axis.text.x = element_text(angle = -90, vjust = .8, hjust=0))
+
+plt
+
+```
+
+#Validation, Permutation Testing on Selected Features
+
+```{r Validation, Permutation of Selected Features}
+#Set options for feature selection approach, using LASSO feature selection
+opts_sel <- list(n_trials = 100, threshold = 0.8, return_count = FALSE)
+select <- function(X, y) { return(select_repeat(X, y, 
+                                                selector = select_lasso, 
+                                                options = opts_sel)) }
+method = list(select = select,
+              train = train_ropls,
+              predict = predict_ropls,
+              score = score_accuracy)
+
+#How many total trials, permutation (pt) trials, and random feature (rf) trials?
+opts = list(n_folds = 5, pt_trials = 1, rf_trials = 1)
+return_vals2 <- validate_repeat(X_subgroup, y_subgroup, 
+                                method, opts, n_trials = 100)
+visualize_validate(return_vals2)
+#Average cross-validation scores across trials
+u2 <- rowMeans(sapply(return_vals2, unlist))[1]
+u2
+u3 <- rowMeans(sapply(return_vals2,unlist))
+u3
+
+```
+
+#Correlation Mapping as heatmap
+
+```{r correlation heatmap}
+#Spearman correlations between all features
+corrMat <- cor(X_subgroup, method = "spearman")
+# heatmap for full correlation matrix
+pheatmap(-corrMat, cluster_rows = FALSE, cluster_cols = FALSE,        
+         color = colorRampPalette(brewer.pal(n = 10, name = "RdBu"))(100),
+         breaks = seq(1, -1, length = 100),
+         cellwidth = 7, cellheight = 6, fontsize = 6, border_color = "NA") 
+
+# keep only selected features and highly correlated features
+colMax <- function(X) apply(X, 2, max)
+corrMat <- corrMat[sel_features$sel_features, ]
+corrMat <- corrMat[, which(colMax(abs(corrMat)) < 1 & colMax(abs(corrMat)) > 0.7)]
+# heatmap for reduced correlation matrix
+pheatmap(-corrMat, cluster_rows = FALSE, cluster_cols = FALSE,        
+         color = colorRampPalette(brewer.pal(n = 10, name = "RdBu"))(100),
+         breaks = seq(1, -1, length = 100),
+         cellwidth = 20, cellheight = 20, fontsize = 8, border_color = "NA")
+
+```
+
+## Co-correlation network of features correlated to selected features
+
+```{r Co-correlation network, message=FALSE} 
+#Spearman correlations between all features
+tidyCors <- X_subgroup %>% 
+  correlate(method = "spearman") %>% 
+  stretch()
+
+#Test correlation significance and store p value in new p variable
+tidyCors$p <- 0
+for (ind in 1:dim(tidyCors)[1]) {
+  tmp <- cor.test(X[,tidyCors$x[ind]], X[,tidyCors$y[ind]], 
+                  method = "spearman", exact = FALSE)
+  tidyCors$p[ind] <- tmp$p.value
+}
+#Multiple hypothesis correction via Benjamini-Hochberg
+tidyCors$p <- p.adjust(tidyCors$p, method = "BH", n = length(tidyCors$p))
+
+#Which features do you want to plot correlations to?
+plotFeatures <- sel_features$sel_features #selected features
+
+#Pull out only significant (p<0.05) and highly correlated 
+#(abs(spearman corr) > 0.7) features
+graphCors <- tidyCors %>% 
+  filter(p < 0.05 & abs(r) > 0.7 & 
+           (is.element(x, plotFeatures) | is.element(y, plotFeatures))) %>% 
+  graph_from_data_frame(directed = FALSE)
+
+#Visualization options for network graphs
+layout <- create_layout(graphCors, layout = 'igraph', algorithm = 'in_circle') 
+            #in_circle, nicely, with_kk are all good options
+nodeColours <- vector(mode = "list", length = length(V(graphCors)$name))
+    # selected features colored gray
+nodeColours[is.element(V(graphCors)$name, plotFeatures)] <- 'gray' 
+    # other features colored white
+nodeColours[!is.element(V(graphCors)$name, plotFeatures)] <- 'white' 
+
+pltGraph <- ggraph(layout) +
+  geom_edge_link(aes(color = r), edge_width = .5) +
+  guides(edge_alpha = "none", edge_width = "none") +
+  scale_edge_colour_gradientn(colors = rev(colorRampPalette(brewer.pal(n = 11, 
+              name = "RdYlBu"))(100)))+ #choose color palette for visualization
+  geom_node_point(shape = 21, color = "gray", 
+                  fill = nodeColours, size = 9, stroke = 0.5) +
+  geom_node_text(aes(label = name, fontface = "bold"), size = 2, 
+                 point.padding = NA,  box.padding = 0, force = 0.1, repel = T) + 
+  theme(aspect.ratio = 1) +
+  theme_graph(background = "white", base_family = 'Helvetica') 
+
+plt <- plot(pltGraph)
+
+#print to pdf, changing folder path to suite your environment
+#Additionally, consider changing file name to correct group comparison
+pdf("../MalariaVax/Figures/CorrelationNetwork_G3vG4_circle.pdf", 
+       width = 15, height = 8) 
+print(plt)
+dev.off()
+```
